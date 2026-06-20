@@ -1,53 +1,42 @@
 # ============================================================
-# Orca Security — Combined Scan Workflow
-# Runs on PRs targeting ANY branch — not just main/default
+# Orca Security — Combined Scan Workflow (FIXED)
+# Fixes:
+#   1. shiftleft-sca-action → shiftleft-fs-action (renamed)
+#   2. SARIF output path → results/scan.sarif (not a folder)
+#   3. Added step IDs for exit_code check on upload
 # ============================================================
 
 name: Orca Security Scans
 
 on:
-  # ── Option 1: Scan PRs targeting ANY branch ──────────────
-  # Remove the branches filter entirely under pull_request
-  # This fires for every PR regardless of target branch
   pull_request:
-    # NO branches filter here = triggers on ALL target branches
-    # e.g. PR → main, PR → develop, PR → release/v2 all trigger
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened]   # any branch PR
 
-  # ── Option 2: Scan pushes to specific branches ───────────
-  # Add whichever branches your team works on
   push:
     branches:
       - main
       - master
 
-  # ── Option 3: Manual trigger (test any branch on demand) ─
-  workflow_dispatch:
-    inputs:
-      branch_name:
-        description: 'Branch being scanned'
-        required: false
-        default: 'manual run'
-
-  # ── Scheduled daily scan ─────────────────────────────────
   schedule:
     - cron: '0 0 * * *'
 
-# ── Permissions ─────────────────────────────────────────────
+  workflow_dispatch:
+
 permissions:
   contents: read
   security-events: write
   actions: read
-  pull-requests: write      # needed to post scan results as PR comment
+  pull-requests: write
 
-# ── Global env ──────────────────────────────────────────────
 env:
   PROJECT_KEY: testing-project-vinayak   # ← replace with your Orca project key
 
 jobs:
 
   # ──────────────────────────────────────────────────────────
-  # JOB 1 — SAST Scan
+  # JOB 1 — SAST
+  # Action: shiftleft-sast-action@v1
+  # Output: results/sast.sarif
   # ──────────────────────────────────────────────────────────
   sast-scan:
     name: SAST Scan
@@ -58,23 +47,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # For PRs — checkout the actual PR head not the merge commit
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Run Orca SAST Scan
+        id: orcasecurity_sast_scan          # ← id needed for exit_code
         uses: orcasecurity/shiftleft-sast-action@v1
         with:
           api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
           project_key: ${{ env.PROJECT_KEY }}
           path: "."
-          output: "results/sast"
           format: "sarif"
+          output: "results/"               # ← writes to results/sast.sarif
 
-      - name: Upload SAST SARIF
+      - name: Upload SAST SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: ${{ always() && steps.orcasecurity_sast_scan.outputs.exit_code != 1 }}
         with:
-          sarif_file: results/sast/
+          sarif_file: results/sast.sarif   # ← exact file not folder
           category: orca-sast
 
       - name: Upload SAST artifact
@@ -82,11 +70,13 @@ jobs:
         if: always()
         with:
           name: orca-sast-results
-          path: results/sast/
+          path: results/sast.sarif
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────
-  # JOB 2 — IaC Scan
+  # JOB 2 — IaC
+  # Action: shiftleft-iac-action@v1
+  # Output: results/iac.sarif
   # ──────────────────────────────────────────────────────────
   iac-scan:
     name: IaC Scan
@@ -95,23 +85,22 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Run Orca IaC Scan
+        id: orcasecurity_iac_scan
         uses: orcasecurity/shiftleft-iac-action@v1
         with:
           api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
           project_key: ${{ env.PROJECT_KEY }}
-          path: "terraform,kubernetes,bicep"   # ← adjust to your dirs
-          output: "results/iac"
+          path: "."                        # ← scan entire repo for IaC files
           format: "sarif"
+          output: "results/"              # ← writes to results/iac.sarif
 
-      - name: Upload IaC SARIF
+      - name: Upload IaC SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: ${{ always() && steps.orcasecurity_iac_scan.outputs.exit_code != 1 }}
         with:
-          sarif_file: results/iac/
+          sarif_file: results/iac.sarif   # ← exact file not folder
           category: orca-iac
 
       - name: Upload IaC artifact
@@ -119,11 +108,13 @@ jobs:
         if: always()
         with:
           name: orca-iac-results
-          path: results/iac/
+          path: results/iac.sarif
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────
-  # JOB 3 — SCA Scan
+  # JOB 3 — SCA (dependency scanning)
+  # Action: shiftleft-fs-action@v1  ← RENAMED from sca-action
+  # Output: results/sca.sarif
   # ──────────────────────────────────────────────────────────
   sca-scan:
     name: SCA Scan
@@ -132,23 +123,22 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Run Orca SCA Scan
-        uses: orcasecurity/shiftleft-sca-action@v1
+        id: orcasecurity_sca_scan
+        uses: orcasecurity/shiftleft-fs-action@v1   # ← FIXED name
         with:
           api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
           project_key: ${{ env.PROJECT_KEY }}
           path: "."
-          output: "results/sca"
           format: "sarif"
+          output: "results/"              # ← writes to results/sca.sarif
 
-      - name: Upload SCA SARIF
+      - name: Upload SCA SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: ${{ always() && steps.orcasecurity_sca_scan.outputs.exit_code != 1 }}
         with:
-          sarif_file: results/sca/
+          sarif_file: results/sca.sarif   # ← exact file not folder
           category: orca-sca
 
       - name: Upload SCA artifact
@@ -156,11 +146,13 @@ jobs:
         if: always()
         with:
           name: orca-sca-results
-          path: results/sca/
+          path: results/sca.sarif
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────
-  # JOB 4 — Secrets Scan
+  # JOB 4 — Secrets
+  # Action: shiftleft-secrets-action@v1
+  # Output: results/secrets.sarif
   # ──────────────────────────────────────────────────────────
   secrets-scan:
     name: Secrets Scan
@@ -171,21 +163,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Run Orca Secrets Scan
+        id: orcasecurity_secrets_scan
         uses: orcasecurity/shiftleft-secrets-action@v1
         with:
           api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
           project_key: ${{ env.PROJECT_KEY }}
-          output: "results/secrets"
           format: "sarif"
+          output: "results/"             # ← writes to results/secrets.sarif
 
-      - name: Upload Secrets SARIF
+      - name: Upload Secrets SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: ${{ always() && steps.orcasecurity_secrets_scan.outputs.exit_code != 1 }}
         with:
-          sarif_file: results/secrets/
+          sarif_file: results/secrets.sarif  # ← exact file not folder
           category: orca-secrets
 
       - name: Upload Secrets artifact
@@ -193,12 +185,12 @@ jobs:
         if: always()
         with:
           name: orca-secrets-results
-          path: results/secrets/
+          path: results/secrets.sarif
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────
-  # JOB 5 — Summary + PR Comment
-  # Posts scan result summary as a comment on the PR
+  # JOB 5 — Summary (waits for all 4, posts PR comment)
+  # Add "Scan Summary" to branch protection required checks
   # ──────────────────────────────────────────────────────────
   scan-summary:
     name: Scan Summary
@@ -210,50 +202,39 @@ jobs:
       - name: Print summary
         run: |
           echo "========================================"
-          echo "        ORCA SECURITY SCAN SUMMARY      "
+          echo "     ORCA SECURITY SCAN SUMMARY         "
           echo "========================================"
           echo "Branch  : ${{ github.head_ref || github.ref_name }}"
-          echo "Target  : ${{ github.base_ref || 'N/A' }}"
-          echo "Commit  : ${{ github.sha }}"
+          echo "Target  : ${{ github.base_ref || 'push' }}"
           echo "SAST    : ${{ needs.sast-scan.result }}"
           echo "IaC     : ${{ needs.iac-scan.result }}"
           echo "SCA     : ${{ needs.sca-scan.result }}"
           echo "Secrets : ${{ needs.secrets-scan.result }}"
           echo "========================================"
 
-      # Post results as a comment on the PR (only for PR events)
-      - name: Post PR comment with scan results
+      - name: Post PR comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const sast    = '${{ needs.sast-scan.result }}';
-            const iac     = '${{ needs.iac-scan.result }}';
-            const sca     = '${{ needs.sca-scan.result }}';
-            const secrets = '${{ needs.secrets-scan.result }}';
-
-            const icon = (r) => r === 'success' ? '✅' : r === 'failure' ? '❌' : '⚠️';
-
-            const body = `
-            ## 🔐 Orca Security Scan Results
-
-            | Scan type | Result |
-            |-----------|--------|
-            | SAST (source code) | ${icon(sast)} ${sast} |
-            | IaC (infra as code) | ${icon(iac)} ${iac} |
-            | SCA (dependencies) | ${icon(sca)} ${sca} |
-            | Secrets | ${icon(secrets)} ${secrets} |
+            const r = {
+              sast:    '${{ needs.sast-scan.result }}',
+              iac:     '${{ needs.iac-scan.result }}',
+              sca:     '${{ needs.sca-scan.result }}',
+              secrets: '${{ needs.secrets-scan.result }}'
+            };
+            const icon = s => s === 'success' ? '✅' : s === 'failure' ? '❌' : '⚠️';
+            const anyFail = Object.values(r).some(s => s === 'failure');
+            const body = `## 🔐 Orca Security Scan Results
+            | Scan | Result |
+            |------|--------|
+            | SAST | ${icon(r.sast)} ${r.sast} |
+            | IaC  | ${icon(r.iac)} ${r.iac} |
+            | SCA  | ${icon(r.sca)} ${r.sca} |
+            | Secrets | ${icon(r.secrets)} ${r.secrets} |
 
             **Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`
-            **Commit:** \`${{ github.sha }}\`
-
-            ${sast === 'failure' || iac === 'failure' || sca === 'failure' || secrets === 'failure'
-              ? '> ⚠️ One or more scans found issues. Check the **Security** tab and **Actions** artifacts for details.'
-              : '> ✅ All scans passed. No issues found.'}
-
-            [View full results in Orca portal](https://app.us.orcasecurity.io)
-            `;
-
+            ${anyFail ? '> ⚠️ Issues found — check the **Security** tab for details.' : '> ✅ All scans passed.'}`;
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -261,8 +242,6 @@ jobs:
               body: body
             });
 
-      # Fail the summary if any scan failed
-      # Add THIS job to branch protection required checks
       - name: Fail if any scan failed
         if: |
           needs.sast-scan.result    == 'failure' ||
@@ -270,6 +249,5 @@ jobs:
           needs.sca-scan.result     == 'failure' ||
           needs.secrets-scan.result == 'failure'
         run: |
-          echo "One or more Orca scans failed."
-          echo "Check Security tab for details."
+          echo "One or more Orca scans failed — check Security tab."
           exit 1
