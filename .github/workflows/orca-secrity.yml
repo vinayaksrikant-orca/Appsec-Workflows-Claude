@@ -20,10 +20,6 @@ on:
     branches:
       - main
       - master
-      - develop
-      - "release/**"      # matches release/v1, release/v2 etc
-      - "hotfix/**"       # matches hotfix/fix-login etc
-      - "feature/**"      # matches any feature branch
 
   # ── Option 3: Manual trigger (test any branch on demand) ─
   workflow_dispatch:
@@ -46,7 +42,7 @@ permissions:
 
 # ── Global env ──────────────────────────────────────────────
 env:
-  PROJECT_KEY: your-project-key   # ← replace with your Orca project key
+  PROJECT_KEY: testing-project-vinayak   # ← replace with your Orca project key
 
 jobs:
 
