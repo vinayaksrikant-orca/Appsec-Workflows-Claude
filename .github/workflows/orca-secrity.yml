@@ -1,6 +1,7 @@
 # ============================================================
 # Orca Security — SAST Scan Only
-# Shows findings INLINE in PR comment — no Security tab needed
+# Fixed: SARIF severity parsing reads Orca's actual fields
+#        not standard SARIF level field
 # ============================================================
 
 name: Orca SAST Scan
@@ -14,6 +15,8 @@ on:
       - main
       - master
       - develop
+      - "release/**"
+      - "hotfix/**"
 
   schedule:
     - cron: '0 0 * * *'
@@ -38,7 +41,7 @@ permissions:
   pull-requests: write
 
 env:
-  PROJECT_KEY: testing-project-vinayak
+  PROJECT_KEY: your-project-key
   FAIL_ON_FINDINGS: ${{ github.event.inputs.fail_on_findings || 'true' }}
 
 jobs:
@@ -70,9 +73,14 @@ jobs:
           output:           "results/"
           show_annotations: true
 
-      - name: Debug — list results
+      - name: Debug — show SARIF structure
         if: always()
-        run: ls -la results/ || echo "results/ directory is empty or missing"
+        run: |
+          echo "=== Files in results/ ==="
+          ls -la results/ || echo "No results directory"
+          echo ""
+          echo "=== First 100 lines of SARIF (for debugging severity fields) ==="
+          head -100 results/sast.sarif 2>/dev/null || echo "No SARIF file found"
 
       - name: Upload SAST SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
@@ -102,8 +110,8 @@ jobs:
           echo "**Commit:** ${{ github.sha }}"                         >> $GITHUB_STEP_SUMMARY
 
   # ──────────────────────────────────────────────────────────
-  # JOB 2 — Summary with INLINE findings in PR comment
-  # Parses SARIF file and shows findings directly in comment
+  # JOB 2 — Summary with inline findings
+  # Fixed SARIF parser — reads Orca severity correctly
   # ──────────────────────────────────────────────────────────
   sast-summary:
     name: SAST Summary
@@ -123,33 +131,107 @@ jobs:
             echo "sast_pass=false" >> $GITHUB_OUTPUT
           fi
 
-      # Download the SARIF artifact from the scan job
       - name: Download SAST artifact
         uses: actions/download-artifact@v4
         if: always()
         with:
           name: orca-sast-results
           path: results/
-        continue-on-error: true   # in case artifact doesn't exist
+        continue-on-error: true
 
-      - name: Debug — list downloaded files
+      - name: Debug — print full SARIF for severity investigation
         if: always()
-        run: ls -la results/ || echo "No results downloaded"
+        run: |
+          echo "=== SARIF file contents ==="
+          cat results/sast.sarif 2>/dev/null \
+            | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+runs = data.get('runs', [])
+print(f'Total runs: {len(runs)}')
+for i, run in enumerate(runs):
+    results = run.get('results', [])
+    rules   = run.get('tool', {}).get('driver', {}).get('rules', [])
+    print(f'Run {i}: {len(results)} results, {len(rules)} rules')
+
+    # Print first result in full to see all fields
+    if results:
+        print('--- First result (full) ---')
+        print(json.dumps(results[0], indent=2))
+
+    # Print first rule in full to see severity fields
+    if rules:
+        print('--- First rule (full) ---')
+        print(json.dumps(rules[0], indent=2))
+" 2>/dev/null || echo "Could not parse SARIF"
 
       - name: Post PR comment with inline findings
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const fs   = require('fs');
-            const path = require('path');
+            const fs = require('fs');
 
             const exit_code = '${{ needs.sast-scan.outputs.exit_code }}';
             const pass      = ${{ steps.evaluate.outputs.sast_pass }};
 
-            // ── Parse SARIF for findings ──────────────────
-            let findingsTable = '';
-            let totalFindings = 0;
+            // ── SARIF severity resolver ───────────────────
+            // Orca puts severity in multiple possible places
+            // This function checks ALL of them in priority order
+            function getSeverity(result, ruleMap) {
+              const ruleId   = result.ruleId || '';
+              const ruleInfo = ruleMap[ruleId] || {};
+
+              // Priority 1: result-level properties (Orca often puts it here)
+              const rProps = result.properties || {};
+              if (rProps['severity'])            return rProps['severity'].toUpperCase();
+              if (rProps['problem.severity'])    return rProps['problem.severity'].toUpperCase();
+              if (rProps['security-severity'])   return rProps['security-severity'];
+
+              // Priority 2: rule-level properties
+              const ruleProps = ruleInfo.properties || {};
+              if (ruleProps['severity'])         return ruleProps['severity'].toUpperCase();
+              if (ruleProps['problem.severity']) return ruleProps['problem.severity'].toUpperCase();
+
+              // Priority 3: rule tags (Orca sometimes puts HIGH/MEDIUM in tags)
+              const tags = ruleProps.tags || [];
+              for (const tag of tags) {
+                const t = tag.toUpperCase();
+                if (['CRITICAL','HIGH','MEDIUM','LOW'].includes(t)) return t;
+              }
+
+              // Priority 4: standard SARIF level field
+              // error → HIGH, warning → MEDIUM, note → LOW
+              const level = result.level || '';
+              if (level === 'error')   return 'HIGH';
+              if (level === 'warning') return 'MEDIUM';
+              if (level === 'note')    return 'LOW';
+
+              // Priority 5: rule defaultConfiguration level
+              const defLevel = ruleInfo.defaultConfiguration?.level || '';
+              if (defLevel === 'error')   return 'HIGH';
+              if (defLevel === 'warning') return 'MEDIUM';
+
+              return 'MEDIUM'; // fallback
+            }
+
+            function sevIcon(s) {
+              switch(s) {
+                case 'CRITICAL': return '🔴 Critical';
+                case 'HIGH':     return '🟠 High';
+                case 'MEDIUM':   return '🟡 Medium';
+                case 'LOW':      return '🔵 Low';
+                default:         return '⚪ Unknown';
+              }
+            }
+
+            function sevOrder(s) {
+              return { 'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3 }[s] ?? 9;
+            }
+
+            // ── Parse SARIF ───────────────────────────────
+            let findingsTable  = '';
+            let totalFindings  = 0;
             let critical = 0, high = 0, medium = 0, low = 0;
 
             try {
@@ -157,76 +239,72 @@ jobs:
 
               if (fs.existsSync(sarifPath)) {
                 const sarif = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
-                const runs  = sarif.runs || [];
 
-                // Collect all findings
-                const findings = [];
-                for (const run of runs) {
-                  const rules = {};
+                for (const run of (sarif.runs || [])) {
 
-                  // Build rule lookup for severity
+                  // Build rule lookup map
+                  const ruleMap = {};
                   for (const rule of (run.tool?.driver?.rules || [])) {
-                    rules[rule.id] = {
-                      name:     rule.name || rule.id,
-                      severity: rule.properties?.['problem.severity']
-                                || rule.defaultConfiguration?.level
-                                || 'unknown',
-                      desc:     rule.shortDescription?.text || rule.fullDescription?.text || ''
-                    };
+                    ruleMap[rule.id] = rule;
                   }
+
+                  const findings = [];
 
                   for (const result of (run.results || [])) {
                     totalFindings++;
-                    const ruleInfo = rules[result.ruleId] || {};
-                    const level    = result.level || ruleInfo.severity || 'note';
-                    const loc      = result.locations?.[0]?.physicalLocation;
-                    const file     = loc?.artifactLocation?.uri || 'unknown';
-                    const line     = loc?.region?.startLine || '-';
-                    const msg      = result.message?.text || ruleInfo.desc || '';
+
+                    const sev  = getSeverity(result, ruleMap);
+                    const loc  = result.locations?.[0]?.physicalLocation;
+                    const file = loc?.artifactLocation?.uri || 'unknown';
+                    const line = loc?.region?.startLine || '-';
+
+                    // Get description — try multiple fields
+                    const rule   = ruleMap[result.ruleId] || {};
+                    const desc   = result.message?.text
+                                || rule.shortDescription?.text
+                                || rule.fullDescription?.text
+                                || '';
+                    const short  = desc.length > 100
+                                 ? desc.substring(0, 100) + '...'
+                                 : desc;
+
+                    // Get rule name (human readable)
+                    const ruleName = rule.name
+                                  || rule.shortDescription?.text
+                                  || result.ruleId
+                                  || 'unknown';
+                    const shortRule = ruleName.length > 40
+                                    ? ruleName.substring(0, 40) + '...'
+                                    : ruleName;
 
                     // Count by severity
-                    if (level === 'error')   critical++;
-                    else if (level === 'warning') high++;
-                    else if (level === 'note')    medium++;
-                    else low++;
+                    if (sev === 'CRITICAL')   critical++;
+                    else if (sev === 'HIGH')   high++;
+                    else if (sev === 'MEDIUM') medium++;
+                    else                       low++;
 
-                    const sevIcon = level === 'error'
-                      ? '🔴 Critical'
-                      : level === 'warning'
-                        ? '🟠 High'
-                        : level === 'note'
-                          ? '🟡 Medium'
-                          : '🔵 Low';
-
-                    findings.push({
-                      severity: sevIcon,
-                      ruleId:   result.ruleId || 'unknown',
-                      file:     file,
-                      line:     line,
-                      message:  msg.length > 120 ? msg.substring(0, 120) + '...' : msg
-                    });
+                    findings.push({ sev, shortRule, file, line, short });
                   }
-                }
 
-                // Sort by severity (critical first)
-                const sevOrder = { '🔴 Critical': 0, '🟠 High': 1, '🟡 Medium': 2, '🔵 Low': 3 };
-                findings.sort((a, b) => (sevOrder[a.severity] || 9) - (sevOrder[b.severity] || 9));
+                  // Sort critical → high → medium → low
+                  findings.sort((a, b) => sevOrder(a.sev) - sevOrder(b.sev));
 
-                // Build findings table (max 20 rows to avoid huge comments)
-                if (findings.length > 0) {
-                  const shown    = findings.slice(0, 20);
-                  const overflow = findings.length > 20
-                    ? `\n> ⚠️ Showing first 20 of ${findings.length} findings.`
-                    : '';
+                  if (findings.length > 0) {
+                    const shown    = findings.slice(0, 25);
+                    const overflow = findings.length > 25
+                      ? `\n> ⚠️ Showing first 25 of **${findings.length}** findings. View all in Orca portal.`
+                      : '';
 
-                  findingsTable = `
+                    findingsTable = `
             | Severity | Rule | File | Line | Description |
             |----------|------|------|------|-------------|
             ${shown.map(f =>
-              `| ${f.severity} | \`${f.ruleId}\` | \`${f.file}\` | ${f.line} | ${f.message} |`
+              `| ${sevIcon(f.sev)} | ${f.shortRule} | \`${f.file}\` | ${f.line} | ${f.short} |`
             ).join('\n')}
             ${overflow}`;
-                }
+                  }
+
+                } // end run loop
 
               } else {
                 findingsTable = '\n> ⚠️ SARIF file not found — check Actions artifacts.';
@@ -234,17 +312,13 @@ jobs:
 
             } catch (err) {
               console.error('SARIF parse error:', err.message);
-              findingsTable = `\n> ⚠️ Could not parse findings: ${err.message}`;
+              findingsTable = `\n> ⚠️ Could not parse SARIF: ${err.message}`;
             }
 
-            // ── Build PR comment body ─────────────────────
+            // ── Build comment ─────────────────────────────
             const icon   = pass ? '✅' : '❌';
             const status = pass ? 'Pass' : `Fail (exit code: ${exit_code})`;
-
-            // Summary counts line
-            const counts = totalFindings > 0
-              ? `🔴 ${critical} Critical &nbsp; 🟠 ${high} High &nbsp; 🟡 ${medium} Medium &nbsp; 🔵 ${low} Low`
-              : '';
+            const counts = `🔴 ${critical} Critical &nbsp; 🟠 ${high} High &nbsp; 🟡 ${medium} Medium &nbsp; 🔵 ${low} Low`;
 
             const body = `## 🔐 Orca SAST Scan Result
 
@@ -255,23 +329,20 @@ jobs:
             **Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`
             **Commit:** \`${{ github.sha }}\`
 
-            ${counts ? `**Severity breakdown:** ${counts}` : ''}
+            **Severity breakdown:** ${counts}
 
-            ${totalFindings > 0
-              ? `### 📋 Findings\n${findingsTable}`
-              : '### 📋 Findings\n> ✅ No issues found in this scan.'}
+            ### 📋 Findings
+            ${totalFindings > 0 ? findingsTable : '> ✅ No issues found.'}
 
-            ${pass
-              ? ''
-              : '> ❌ Fix the issues above and push again to re-trigger the scan.\n> Merge is blocked until this scan passes.'}
+            ${pass ? '' : '> ❌ Fix the issues above and push again to re-trigger the scan.'}
 
             [View in Orca portal](https://app.us.orcasecurity.io)`;
 
-            // ── Delete old bot comment ────────────────────
+            // Delete old bot comment
             const comments = await github.rest.issues.listComments({
               issue_number: context.issue.number,
-              owner:        context.repo.owner,
-              repo:         context.repo.repo
+              owner: context.repo.owner,
+              repo:  context.repo.repo
             });
             for (const c of comments.data) {
               if (c.user.type === 'Bot' && c.body.includes('Orca SAST Scan Result')) {
@@ -283,12 +354,12 @@ jobs:
               }
             }
 
-            // ── Post fresh comment ────────────────────────
+            // Post fresh comment
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
-              owner:        context.repo.owner,
-              repo:         context.repo.repo,
-              body:         body
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              body:  body
             });
 
       - name: Write job summary
@@ -309,6 +380,4 @@ jobs:
         run: |
           echo "❌ SAST scan found issues."
           echo "   Exit code: ${{ needs.sast-scan.outputs.exit_code }}"
-          echo ""
-          echo "Fix the findings above and push again."
           exit 1
