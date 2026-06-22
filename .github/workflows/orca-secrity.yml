@@ -1,275 +1,221 @@
 # ============================================================
-# Orca Security — Combined Scan Workflow
-# Runs on PRs targeting ANY branch — not just main/default
+# Orca Security — SAST Scan Only (Enterprise Grade)
+# Exact same logic as combined workflow but SAST only
 # ============================================================
 
-name: Orca Security Scans
+name: Orca SAST Scan
 
 on:
-  # ── Option 1: Scan PRs targeting ANY branch ──────────────
-  # Remove the branches filter entirely under pull_request
-  # This fires for every PR regardless of target branch
   pull_request:
-    # NO branches filter here = triggers on ALL target branches
-    # e.g. PR → main, PR → develop, PR → release/v2 all trigger
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
-  # ── Option 2: Scan pushes to specific branches ───────────
-  # Add whichever branches your team works on
   push:
     branches:
       - main
       - master
+      - develop
 
-  # ── Option 3: Manual trigger (test any branch on demand) ─
-  workflow_dispatch:
-    inputs:
-      branch_name:
-        description: 'Branch being scanned'
-        required: false
-        default: 'manual run'
-
-  # ── Scheduled daily scan ─────────────────────────────────
   schedule:
     - cron: '0 0 * * *'
 
-# ── Permissions ─────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      fail_on_findings:
+        description: 'Fail pipeline if issues found?'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+# ── Cancel in-progress runs for same PR ─────────────────────
+concurrency:
+  group: orca-sast-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   security-events: write
   actions: read
-  pull-requests: write      # needed to post scan results as PR comment
+  pull-requests: write
 
-# ── Global env ──────────────────────────────────────────────
 env:
-  PROJECT_KEY: testing-project-vinayak   # ← replace with your Orca project key
+  PROJECT_KEY: testing-project-vinayak    # ← replace with your Orca project key
+  FAIL_ON_FINDINGS: ${{ github.event.inputs.fail_on_findings || 'true' }}
 
 jobs:
 
   # ──────────────────────────────────────────────────────────
-  # JOB 1 — SAST Scan
+  # JOB 1 — Skip draft PRs
+  # ──────────────────────────────────────────────────────────
+  check-draft:
+    name: Check if draft PR
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.check.outputs.is_draft }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event.pull_request.draft }}" == "true" ]; then
+            echo "is_draft=true" >> $GITHUB_OUTPUT
+            echo "Draft PR — skipping SAST scan"
+          else
+            echo "is_draft=false" >> $GITHUB_OUTPUT
+            echo "Not a draft — SAST scan will run"
+          fi
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2 — SAST Scan
+  # Output SARIF: results/sast.sarif
+  # Exit code:    0 = clean, >0 = findings
   # ──────────────────────────────────────────────────────────
   sast-scan:
     name: SAST Scan
     runs-on: ubuntu-latest
-    continue-on-error: true
+    needs: check-draft
+    if: needs.check-draft.outputs.should_skip != 'true'
+    timeout-minutes: 15
+    outputs:
+      exit_code: ${{ steps.scan.outputs.exit_code }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # For PRs — checkout the actual PR head not the merge commit
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Run Orca SAST Scan
+        id: scan
+        continue-on-error: true
         uses: orcasecurity/shiftleft-sast-action@v1
         with:
-          api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key: ${{ env.PROJECT_KEY }}
-          path: "."
-          output: "results/sast"
-          format: "sarif"
+          api_token:        ${{ secrets.ORCA_SECURITY_API_TOKEN }}
+          project_key:      ${{ env.PROJECT_KEY }}
+          path:             "."
+          format:           "sarif"
+          output:           "results/"
+          show_annotations: true
 
-      - name: Upload SAST SARIF
+      - name: Debug — list results
+        if: always()
+        run: ls -la results/ || echo "results/ directory is empty or missing"
+
+      - name: Upload SAST SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: results/sast/
-          category: orca-sast
+          sarif_file: results/sast.sarif
+          category:   orca-sast
 
       - name: Upload SAST artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: orca-sast-results
-          path: results/sast/
+          name:           orca-sast-results
+          path:           results/sast.sarif
           retention-days: 30
 
+      - name: Write to job summary
+        if: always()
+        run: |
+          EXIT="${{ steps.scan.outputs.exit_code }}"
+          STATUS=$([ "$EXIT" == "0" ] \
+            && echo "✅ No issues found" \
+            || echo "❌ Issues found (exit code: $EXIT)")
+          echo "### SAST Scan" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** $STATUS"             >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.head_ref || github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}"   >> $GITHUB_STEP_SUMMARY
+
   # ──────────────────────────────────────────────────────────
-  # JOB 2 — IaC Scan
+  # JOB 3 — Summary
+  # Reads exit_code output — not step outcome or job result
+  # Add "SAST Summary" to branch protection required checks
   # ──────────────────────────────────────────────────────────
-  iac-scan:
-    name: IaC Scan
+  sast-summary:
+    name: SAST Summary
     runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Run Orca IaC Scan
-        uses: orcasecurity/shiftleft-iac-action@v1
-        with:
-          api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key: ${{ env.PROJECT_KEY }}
-          path: "terraform,kubernetes,bicep"   # ← adjust to your dirs
-          output: "results/iac"
-          format: "sarif"
-
-      - name: Upload IaC SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results/iac/
-          category: orca-iac
-
-      - name: Upload IaC artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: orca-iac-results
-          path: results/iac/
-          retention-days: 30
-
-  # ──────────────────────────────────────────────────────────
-  # JOB 3 — SCA Scan
-  # ──────────────────────────────────────────────────────────
-  sca-scan:
-    name: SCA Scan
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Run Orca SCA Scan
-        uses: orcasecurity/shiftleft-sca-action@v1
-        with:
-          api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key: ${{ env.PROJECT_KEY }}
-          path: "."
-          output: "results/sca"
-          format: "sarif"
-
-      - name: Upload SCA SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results/sca/
-          category: orca-sca
-
-      - name: Upload SCA artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: orca-sca-results
-          path: results/sca/
-          retention-days: 30
-
-  # ──────────────────────────────────────────────────────────
-  # JOB 4 — Secrets Scan
-  # ──────────────────────────────────────────────────────────
-  secrets-scan:
-    name: Secrets Scan
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Run Orca Secrets Scan
-        uses: orcasecurity/shiftleft-secrets-action@v1
-        with:
-          api_token:   ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key: ${{ env.PROJECT_KEY }}
-          output: "results/secrets"
-          format: "sarif"
-
-      - name: Upload Secrets SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results/secrets/
-          category: orca-secrets
-
-      - name: Upload Secrets artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: orca-secrets-results
-          path: results/secrets/
-          retention-days: 30
-
-  # ──────────────────────────────────────────────────────────
-  # JOB 5 — Summary + PR Comment
-  # Posts scan result summary as a comment on the PR
-  # ──────────────────────────────────────────────────────────
-  scan-summary:
-    name: Scan Summary
-    runs-on: ubuntu-latest
-    needs: [sast-scan, iac-scan, sca-scan, secrets-scan]
+    needs: sast-scan
     if: always()
     steps:
 
-      - name: Print summary
+      - name: Evaluate result
+        id: evaluate
         run: |
-          echo "========================================"
-          echo "        ORCA SECURITY SCAN SUMMARY      "
-          echo "========================================"
-          echo "Branch  : ${{ github.head_ref || github.ref_name }}"
-          echo "Target  : ${{ github.base_ref || 'N/A' }}"
-          echo "Commit  : ${{ github.sha }}"
-          echo "SAST    : ${{ needs.sast-scan.result }}"
-          echo "IaC     : ${{ needs.iac-scan.result }}"
-          echo "SCA     : ${{ needs.sca-scan.result }}"
-          echo "Secrets : ${{ needs.secrets-scan.result }}"
-          echo "========================================"
+          EXIT="${{ needs.sast-scan.outputs.exit_code }}"
+          echo "SAST exit code: $EXIT"
 
-      # Post results as a comment on the PR (only for PR events)
-      - name: Post PR comment with scan results
+          if [ "$EXIT" == "0" ]; then
+            echo "sast_pass=true"  >> $GITHUB_OUTPUT
+          else
+            echo "sast_pass=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## 🔐 Orca SAST Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan  | SAST (source code) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Exit code | ${{ needs.sast-scan.outputs.exit_code }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.evaluate.outputs.sast_pass == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.head_ref || github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post PR comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const sast    = '${{ needs.sast-scan.result }}';
-            const iac     = '${{ needs.iac-scan.result }}';
-            const sca     = '${{ needs.sca-scan.result }}';
-            const secrets = '${{ needs.secrets-scan.result }}';
+            const exit_code = '${{ needs.sast-scan.outputs.exit_code }}';
+            const pass      = ${{ steps.evaluate.outputs.sast_pass }};
+            const icon      = pass ? '✅' : '❌';
+            const status    = pass ? 'Pass' : `Fail (exit code: ${exit_code})`;
 
-            const icon = (r) => r === 'success' ? '✅' : r === 'failure' ? '❌' : '⚠️';
+            const body = `## 🔐 Orca SAST Scan Result
 
-            const body = `
-            ## 🔐 Orca Security Scan Results
-
-            | Scan type | Result |
+            | Scan type | Status |
             |-----------|--------|
-            | SAST (source code) | ${icon(sast)} ${sast} |
-            | IaC (infra as code) | ${icon(iac)} ${iac} |
-            | SCA (dependencies) | ${icon(sca)} ${sca} |
-            | Secrets | ${icon(secrets)} ${secrets} |
+            | SAST (source code) | ${icon} ${status} |
 
             **Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`
             **Commit:** \`${{ github.sha }}\`
 
-            ${sast === 'failure' || iac === 'failure' || sca === 'failure' || secrets === 'failure'
-              ? '> ⚠️ One or more scans found issues. Check the **Security** tab and **Actions** artifacts for details.'
-              : '> ✅ All scans passed. No issues found.'}
+            ${pass
+              ? '> ✅ SAST scan passed. No issues found.'
+              : '> ❌ SAST scan found issues. Check the **Security tab** and inline PR annotations for details.'}
 
-            [View full results in Orca portal](https://app.us.orcasecurity.io)
-            `;
+            [View in Orca portal](https://app.us.orcasecurity.io) | [Security tab](/${{ github.repository }}/security/code-scanning)`;
 
-            github.rest.issues.createComment({
+            // Delete previous bot comment if exists
+            const comments = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            for (const c of comments.data) {
+              if (c.user.type === 'Bot' && c.body.includes('Orca SAST Scan Result')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id
+                });
+              }
+            }
+
+            // Post fresh comment
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: body
             });
 
-      # Fail the summary if any scan failed
-      # Add THIS job to branch protection required checks
-      - name: Fail if any scan failed
-        if: |
-          needs.sast-scan.result    == 'failure' ||
-          needs.iac-scan.result     == 'failure' ||
-          needs.sca-scan.result     == 'failure' ||
-          needs.secrets-scan.result == 'failure'
+      - name: Fail if SAST found issues
+        if: steps.evaluate.outputs.sast_pass == 'false' && env.FAIL_ON_FINDINGS == 'true'
         run: |
-          echo "One or more Orca scans failed."
-          echo "Check Security tab for details."
+          echo "❌ SAST scan found issues."
+          echo "   Exit code: ${{ needs.sast-scan.outputs.exit_code }}"
+          echo ""
+          echo "Check Security tab or PR annotations for details."
           exit 1
