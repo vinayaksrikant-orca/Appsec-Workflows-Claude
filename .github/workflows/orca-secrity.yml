@@ -147,22 +147,27 @@ jobs:
             const exit_code = '${{ needs.sast-scan.outputs.exit_code }}';
             const pass = ${{ steps.evaluate.outputs.sast_pass }};
 
-            function getSeverity(result, ruleMap) {
-              const ruleInfo  = ruleMap[result.ruleId || ''] || {};
-              const rProps    = result.properties || {};
-              const ruleProps = ruleInfo.properties || {};
-              if (rProps['severity'])          return rProps['severity'].toUpperCase();
-              if (rProps['problem.severity'])  return rProps['problem.severity'].toUpperCase();
-              if (rProps['security-severity']) return rProps['security-severity'].toUpperCase();
-              if (ruleProps['severity'])       return ruleProps['severity'].toUpperCase();
-              for (const tag of (ruleProps.tags || [])) {
-                const t = tag.toUpperCase();
-                if (['CRITICAL','HIGH','MEDIUM','LOW'].includes(t)) return t;
-              }
-              const level = result.level || ruleInfo.defaultConfiguration?.level || '';
+            // KEY FIX: Orca SAST SARIF uses ruleIndex (not ruleId) to look up rules
+            // AND uses numeric CVSS score in security-severity (not HIGH/MEDIUM strings)
+            function getSeverity(result, rulesArray) {
+              // Use ruleIndex to find the rule — ruleId does NOT match rule.id in Orca SARIF
+              const idx      = result.ruleIndex ?? 0;
+              const rule     = rulesArray[idx] || {};
+              const rProps   = rule.properties || {};
+
+              // Priority 1: CVSS numeric score → map to severity label
+              const score = parseFloat(rProps['security-severity'] || '0');
+              if (score >= 9.0) return 'CRITICAL';
+              if (score >= 7.0) return 'HIGH';
+              if (score >= 4.0) return 'MEDIUM';
+              if (score >  0.0) return 'LOW';
+
+              // Priority 2: defaultConfiguration.level fallback
+              const level = rule.defaultConfiguration?.level || result.level || '';
               if (level === 'error')   return 'HIGH';
               if (level === 'warning') return 'MEDIUM';
               if (level === 'note')    return 'LOW';
+
               return 'MEDIUM';
             }
 
@@ -181,13 +186,13 @@ jobs:
               if (fs.existsSync('results/sast.sarif')) {
                 const sarif = JSON.parse(fs.readFileSync('results/sast.sarif', 'utf8'));
                 for (const run of (sarif.runs || [])) {
-                  const ruleMap = {};
-                  for (const rule of (run.tool?.driver?.rules || [])) ruleMap[rule.id] = rule;
+                  // Use array — ruleIndex is the lookup key not ruleId
+                  const rulesArray = run.tool?.driver?.rules || [];
                   const findings = [];
                   for (const result of (run.results || [])) {
                     totalFindings++;
-                    const sev      = getSeverity(result, ruleMap);
-                    const rule     = ruleMap[result.ruleId] || {};
+                    const sev      = getSeverity(result, rulesArray);
+                    const rule     = rulesArray[result.ruleIndex ?? 0] || {};
                     const loc      = result.locations?.[0]?.physicalLocation;
                     const file     = loc?.artifactLocation?.uri || 'unknown';
                     const line     = loc?.region?.startLine || '-';
