@@ -1,35 +1,17 @@
-# ============================================================
-# Orca Security — Enterprise Grade Scan Workflow v4
-#
-# Fixes:
-#   - Uses exit_code output (not outcome) to detect failures
-#   - exit_code 0 = clean, anything else = issues found
-#
-# Enterprise features:
-#   - Accurate PR comment showing real pass/fail per scan
-#   - Severity threshold control (fail only on CRITICAL/HIGH)
-#   - Scan skipping for draft PRs
-#   - Per-scan timeout protection
-#   - Concurrency control (cancel outdated PR runs)
-#   - Summary in GitHub Actions job summary page
-#   - Annotations on PR diff for exact line findings
-#   - Re-usable across all branches (no branch filter)
-# ============================================================
-
 name: Orca Security Scans
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-
   push:
     branches:
       - main
       - master
-
+      - develop
+      - "release/**"
+      - "hotfix/**"
   schedule:
     - cron: '0 0 * * *'
-
   workflow_dispatch:
     inputs:
       fail_on_findings:
@@ -39,7 +21,6 @@ on:
         type: choice
         options: ['true', 'false']
 
-# ── Cancel in-progress runs for same PR ─────────────────────
 concurrency:
   group: orca-scans-${{ github.ref }}
   cancel-in-progress: true
@@ -51,40 +32,19 @@ permissions:
   pull-requests: write
 
 env:
-  PROJECT_KEY: testing-project-vinayak   # ← replace with your Orca project key
+  PROJECT_KEY: testing-project-key
   FAIL_ON_FINDINGS: ${{ github.event.inputs.fail_on_findings || 'true' }}
 
 jobs:
 
   # ──────────────────────────────────────────────────────────
-  # Skip draft PRs — don't waste scan time on WIP
-  # ──────────────────────────────────────────────────────────
-  check-draft:
-    name: Check if draft PR
-    runs-on: ubuntu-latest
-    outputs:
-      should_skip: ${{ steps.check.outputs.is_draft }}
-    steps:
-      - id: check
-        run: |
-          if [ "${{ github.event.pull_request.draft }}" == "true" ]; then
-            echo "is_draft=true" >> $GITHUB_OUTPUT
-            echo "Draft PR — skipping scans"
-          else
-            echo "is_draft=false" >> $GITHUB_OUTPUT
-            echo "Not a draft — scans will run"
-          fi
-
-  # ──────────────────────────────────────────────────────────
   # JOB 1 — SAST
-  # Output SARIF: results/sast.sarif
-  # Exit code:    0 = clean, >0 = findings
+  # SARIF: results/sast.sarif
+  # Severity: ruleIndex + CVSS numeric score
   # ──────────────────────────────────────────────────────────
   sast-scan:
     name: SAST Scan
     runs-on: ubuntu-latest
-    needs: check-draft
-    if: needs.check-draft.outputs.should_skip != 'true'
     timeout-minutes: 15
     outputs:
       exit_code: ${{ steps.scan.outputs.exit_code }}
@@ -99,49 +59,49 @@ jobs:
         continue-on-error: true
         uses: orcasecurity/shiftleft-sast-action@v1
         with:
-          api_token:      ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key:    ${{ env.PROJECT_KEY }}
-          path:           "."
-          format:         "sarif"
-          output:         "results/"
-          show_annotations: true         # shows findings inline on PR diff
+          api_token: ${{ secrets.ORCA_SECURITY_API_TOKEN }}
+          project_key: ${{ env.PROJECT_KEY }}
+          path: "."
+          format: "sarif"
+          output: "results/"
+          show_annotations: true
 
-      - name: Debug — list results
+      - name: Debug list results
         if: always()
         run: ls -la results/ || echo "results/ directory is empty or missing"
 
-      - name: Upload SAST SARIF
+      - name: Upload SAST SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: results/sast.sarif
-          category:   orca-sast
+          category: orca-sast
 
       - name: Upload SAST artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name:            orca-sast-results
-          path:            results/sast.sarif
-          retention-days:  30
+          name: orca-sast-results
+          path: results/sast.sarif
+          retention-days: 30
 
       - name: Write to job summary
         if: always()
         run: |
           EXIT="${{ steps.scan.outputs.exit_code }}"
-          STATUS=$([ "$EXIT" == "0" ] && echo "✅ No issues found" || echo "❌ Issues found (exit code: $EXIT)")
+          if [ "$EXIT" == "0" ]; then STATUS="✅ No issues found"; else STATUS="❌ Issues found (exit code: $EXIT)"; fi
           echo "### SAST Scan" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** $STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.head_ref || github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
 
   # ──────────────────────────────────────────────────────────
   # JOB 2 — IaC
-  # Output SARIF: results/iac.sarif
+  # SARIF: results/iac.sarif
   # ──────────────────────────────────────────────────────────
   iac-scan:
     name: IaC Scan
     runs-on: ubuntu-latest
-    needs: check-draft
-    if: needs.check-draft.outputs.should_skip != 'true'
     timeout-minutes: 15
     outputs:
       exit_code: ${{ steps.scan.outputs.exit_code }}
@@ -154,49 +114,47 @@ jobs:
         continue-on-error: true
         uses: orcasecurity/shiftleft-iac-action@v1
         with:
-          api_token:        ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key:      ${{ env.PROJECT_KEY }}
-          path:             "."
-          format:           "sarif"
-          output:           "results/"
+          api_token: ${{ secrets.ORCA_SECURITY_API_TOKEN }}
+          project_key: ${{ env.PROJECT_KEY }}
+          path: "."
+          format: "sarif"
+          output: "results/"
           show_annotations: true
 
-      - name: Debug — list results
+      - name: Debug list results
         if: always()
         run: ls -la results/ || echo "results/ directory is empty or missing"
 
-      - name: Upload IaC SARIF
+      - name: Upload IaC SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: results/iac.sarif
-          category:   orca-iac
+          category: orca-iac
 
       - name: Upload IaC artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name:            orca-iac-results
-          path:            results/iac.sarif
-          retention-days:  30
+          name: orca-iac-results
+          path: results/iac.sarif
+          retention-days: 30
 
       - name: Write to job summary
         if: always()
         run: |
           EXIT="${{ steps.scan.outputs.exit_code }}"
-          STATUS=$([ "$EXIT" == "0" ] && echo "✅ No issues found" || echo "❌ Issues found (exit code: $EXIT)")
+          if [ "$EXIT" == "0" ]; then STATUS="✅ No issues found"; else STATUS="❌ Issues found (exit code: $EXIT)"; fi
           echo "### IaC Scan" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** $STATUS" >> $GITHUB_STEP_SUMMARY
 
   # ──────────────────────────────────────────────────────────
   # JOB 3 — SCA (filesystem)
-  # Output SARIF: results/file_system.sarif  ← exact name
+  # SARIF: results/file_system.sarif
   # ──────────────────────────────────────────────────────────
   sca-scan:
     name: SCA Scan
     runs-on: ubuntu-latest
-    needs: check-draft
-    if: needs.check-draft.outputs.should_skip != 'true'
     timeout-minutes: 15
     outputs:
       exit_code: ${{ steps.scan.outputs.exit_code }}
@@ -209,50 +167,48 @@ jobs:
         continue-on-error: true
         uses: orcasecurity/shiftleft-fs-action@v1
         with:
-          api_token:        ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key:      ${{ env.PROJECT_KEY }}
-          path:             "."
-          format:           "sarif"
-          output:           "results/"
+          api_token: ${{ secrets.ORCA_SECURITY_API_TOKEN }}
+          project_key: ${{ env.PROJECT_KEY }}
+          path: "."
+          format: "sarif"
+          output: "results/"
           show_annotations: true
-          disable_secret:   true      # secrets handled by dedicated job below
+          disable_secret: true
 
-      - name: Debug — list results
+      - name: Debug list results
         if: always()
         run: ls -la results/ || echo "results/ directory is empty or missing"
 
-      - name: Upload SCA SARIF
+      - name: Upload SCA SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: results/file_system.sarif   # ← correct filename
-          category:   orca-sca
+          sarif_file: results/file_system.sarif
+          category: orca-sca
 
       - name: Upload SCA artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name:            orca-sca-results
-          path:            results/file_system.sarif
-          retention-days:  30
+          name: orca-sca-results
+          path: results/file_system.sarif
+          retention-days: 30
 
       - name: Write to job summary
         if: always()
         run: |
           EXIT="${{ steps.scan.outputs.exit_code }}"
-          STATUS=$([ "$EXIT" == "0" ] && echo "✅ No issues found" || echo "❌ Issues found (exit code: $EXIT)")
+          if [ "$EXIT" == "0" ]; then STATUS="✅ No issues found"; else STATUS="❌ Issues found (exit code: $EXIT)"; fi
           echo "### SCA Scan" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** $STATUS" >> $GITHUB_STEP_SUMMARY
 
   # ──────────────────────────────────────────────────────────
   # JOB 4 — Secrets
-  # Output SARIF: results/secrets.sarif
+  # SARIF: results/secrets.sarif
   # ──────────────────────────────────────────────────────────
   secrets-scan:
     name: Secrets Scan
     runs-on: ubuntu-latest
-    needs: check-draft
-    if: needs.check-draft.outputs.should_skip != 'true'
     timeout-minutes: 15
     outputs:
       exit_code: ${{ steps.scan.outputs.exit_code }}
@@ -260,51 +216,53 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0              # full history — scan all commits
+          fetch-depth: 0
 
       - name: Run Orca Secrets Scan
         id: scan
         continue-on-error: true
         uses: orcasecurity/shiftleft-secrets-action@v1
         with:
-          api_token:        ${{ secrets.ORCA_SECURITY_API_TOKEN }}
-          project_key:      ${{ env.PROJECT_KEY }}
-          format:           "sarif"
-          output:           "results/"
+          api_token: ${{ secrets.ORCA_SECURITY_API_TOKEN }}
+          project_key: ${{ env.PROJECT_KEY }}
+          format: "sarif"
+          output: "results/"
           show_annotations: true
-          console_output:   "table"   # print findings in logs too
 
-      - name: Debug — list results
+      - name: Debug list results
         if: always()
         run: ls -la results/ || echo "results/ directory is empty or missing"
 
-      - name: Upload Secrets SARIF
+      - name: Upload Secrets SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: results/secrets.sarif
-          category:   orca-secrets
+          category: orca-secrets
 
       - name: Upload Secrets artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name:            orca-secrets-results
-          path:            results/secrets.sarif
-          retention-days:  30
+          name: orca-secrets-results
+          path: results/secrets.sarif
+          retention-days: 30
 
       - name: Write to job summary
         if: always()
         run: |
           EXIT="${{ steps.scan.outputs.exit_code }}"
-          STATUS=$([ "$EXIT" == "0" ] && echo "✅ No issues found" || echo "❌ Issues found (exit code: $EXIT)")
+          if [ "$EXIT" == "0" ]; then STATUS="✅ No issues found"; else STATUS="❌ Issues found (exit code: $EXIT)"; fi
           echo "### Secrets Scan" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** $STATUS" >> $GITHUB_STEP_SUMMARY
 
   # ──────────────────────────────────────────────────────────
-  # JOB 5 — Enterprise Summary
-  # Uses exit_code outputs (not step outcome / job result)
-  # This is the job to add to branch protection rules
+  # JOB 5 — Combined Summary
+  # All 4 run in parallel — this waits for all then:
+  #   - parses all 4 SARIF files with correct severity logic
+  #   - posts ONE combined PR comment with all findings
+  #   - fails if any scan found issues
+  # Add "Scan Summary" to branch protection required checks
   # ──────────────────────────────────────────────────────────
   scan-summary:
     name: Scan Summary
@@ -316,7 +274,6 @@ jobs:
       - name: Evaluate results
         id: evaluate
         run: |
-          # Read exit codes from each scan job output
           SAST_EXIT="${{ needs.sast-scan.outputs.exit_code }}"
           IAC_EXIT="${{ needs.iac-scan.outputs.exit_code }}"
           SCA_EXIT="${{ needs.sca-scan.outputs.exit_code }}"
@@ -324,31 +281,28 @@ jobs:
 
           echo "Exit codes → SAST:$SAST_EXIT IaC:$IAC_EXIT SCA:$SCA_EXIT Secrets:$SEC_EXIT"
 
-          # exit_code 0 = clean, anything else = findings or error
-          SAST_PASS=$([ "$SAST_EXIT" == "0" ] && echo "true" || echo "false")
-          IAC_PASS=$([ "$IAC_EXIT" == "0" ] && echo "true" || echo "false")
-          SCA_PASS=$([ "$SCA_EXIT" == "0" ] && echo "true" || echo "false")
-          SEC_PASS=$([ "$SEC_EXIT" == "0" ] && echo "true" || echo "false")
+          if [ "$SAST_EXIT" == "0" ]; then echo "sast_pass=true" >> $GITHUB_OUTPUT; else echo "sast_pass=false" >> $GITHUB_OUTPUT; fi
+          if [ "$IAC_EXIT"  == "0" ]; then echo "iac_pass=true"  >> $GITHUB_OUTPUT; else echo "iac_pass=false"  >> $GITHUB_OUTPUT; fi
+          if [ "$SCA_EXIT"  == "0" ]; then echo "sca_pass=true"  >> $GITHUB_OUTPUT; else echo "sca_pass=false"  >> $GITHUB_OUTPUT; fi
+          if [ "$SEC_EXIT"  == "0" ]; then echo "secrets_pass=true" >> $GITHUB_OUTPUT; else echo "secrets_pass=false" >> $GITHUB_OUTPUT; fi
 
-          echo "sast_pass=$SAST_PASS"   >> $GITHUB_OUTPUT
-          echo "iac_pass=$IAC_PASS"     >> $GITHUB_OUTPUT
-          echo "sca_pass=$SCA_PASS"     >> $GITHUB_OUTPUT
-          echo "secrets_pass=$SEC_PASS" >> $GITHUB_OUTPUT
-
-          # Overall pass/fail
-          if [ "$SAST_PASS" == "true" ] && \
-             [ "$IAC_PASS"  == "true" ] && \
-             [ "$SCA_PASS"  == "true" ] && \
-             [ "$SEC_PASS"  == "true" ]; then
+          if [ "$SAST_EXIT" == "0" ] && [ "$IAC_EXIT" == "0" ] && [ "$SCA_EXIT" == "0" ] && [ "$SEC_EXIT" == "0" ]; then
             echo "overall_pass=true" >> $GITHUB_OUTPUT
           else
             echo "overall_pass=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Write job summary
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        if: always()
+        with:
+          path: all-results/
+        continue-on-error: true
+
+      - name: Write combined job summary
         if: always()
         run: |
-          echo "## 🔐 Orca Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Orca Security Scan Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Scan | Exit code | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
@@ -356,74 +310,162 @@ jobs:
           echo "| IaC  | ${{ needs.iac-scan.outputs.exit_code }} | ${{ steps.evaluate.outputs.iac_pass == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| SCA  | ${{ needs.sca-scan.outputs.exit_code }} | ${{ steps.evaluate.outputs.sca_pass == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Secrets | ${{ needs.secrets-scan.outputs.exit_code }} | ${{ steps.evaluate.outputs.secrets_pass == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.head_ref || github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
 
-      - name: Post accurate PR comment
+      - name: Post combined PR comment with inline findings
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const results = {
-              sast:    { pass: ${{ steps.evaluate.outputs.sast_pass }},    exit: '${{ needs.sast-scan.outputs.exit_code }}' },
-              iac:     { pass: ${{ steps.evaluate.outputs.iac_pass }},     exit: '${{ needs.iac-scan.outputs.exit_code }}' },
-              sca:     { pass: ${{ steps.evaluate.outputs.sca_pass }},     exit: '${{ needs.sca-scan.outputs.exit_code }}' },
-              secrets: { pass: ${{ steps.evaluate.outputs.secrets_pass }}, exit: '${{ needs.secrets-scan.outputs.exit_code }}' }
+            const fs   = require('fs');
+            const path = require('path');
+
+            const results_meta = {
+              sast:    { pass: ${{ steps.evaluate.outputs.sast_pass }},    exit: '${{ needs.sast-scan.outputs.exit_code }}',    file: 'all-results/orca-sast-results/sast.sarif',         label: 'SAST (source code)' },
+              iac:     { pass: ${{ steps.evaluate.outputs.iac_pass }},     exit: '${{ needs.iac-scan.outputs.exit_code }}',     file: 'all-results/orca-iac-results/iac.sarif',           label: 'IaC (infra as code)' },
+              sca:     { pass: ${{ steps.evaluate.outputs.sca_pass }},     exit: '${{ needs.sca-scan.outputs.exit_code }}',     file: 'all-results/orca-sca-results/file_system.sarif',   label: 'SCA (dependencies)' },
+              secrets: { pass: ${{ steps.evaluate.outputs.secrets_pass }}, exit: '${{ needs.secrets-scan.outputs.exit_code }}', file: 'all-results/orca-secrets-results/secrets.sarif',   label: 'Secrets' }
             };
 
-            const icon   = r => r.pass ? '✅' : '❌';
-            const status = r => r.pass ? 'Pass' : `Fail (exit: ${r.exit})`;
             const overall = ${{ steps.evaluate.outputs.overall_pass }};
 
-            const body = `## 🔐 Orca Security Scan Results
+            // ── Severity resolver using ruleIndex + CVSS score ─
+            // Fixed based on actual Orca SARIF analysis:
+            // - ruleId in results != rule.id in rules (different UUIDs)
+            // - Must use ruleIndex (array position) to look up rules
+            // - Severity is CVSS numeric score not HIGH/MEDIUM string
+            function getSeverity(result, rulesArray) {
+              const idx   = result.ruleIndex ?? 0;
+              const rule  = rulesArray[idx] || {};
+              const props = rule.properties || {};
+              const score = parseFloat(props['security-severity'] || '0');
+              if (score >= 9.0) return 'CRITICAL';
+              if (score >= 7.0) return 'HIGH';
+              if (score >= 4.0) return 'MEDIUM';
+              if (score >  0.0) return 'LOW';
+              const level = rule.defaultConfiguration?.level || result.level || '';
+              if (level === 'error')   return 'HIGH';
+              if (level === 'warning') return 'MEDIUM';
+              if (level === 'note')    return 'LOW';
+              return 'MEDIUM';
+            }
 
-            | Scan type | Status |
-            |-----------|--------|
-            | SAST (source code) | ${icon(results.sast)} ${status(results.sast)} |
-            | IaC (infra as code) | ${icon(results.iac)} ${status(results.iac)} |
-            | SCA (dependencies) | ${icon(results.sca)} ${status(results.sca)} |
-            | Secrets | ${icon(results.secrets)} ${status(results.secrets)} |
+            function sevIcon(s) {
+              return {CRITICAL:'🔴 Critical', HIGH:'🟠 High', MEDIUM:'🟡 Medium', LOW:'🔵 Low'}[s] || '⚪ Unknown';
+            }
+            function sevOrder(s) {
+              return {CRITICAL:0, HIGH:1, MEDIUM:2, LOW:3}[s] ?? 9;
+            }
 
-            **Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`
-            **Commit:** \`${{ github.sha }}\`
+            // ── Parse one SARIF file ───────────────────────────
+            function parseSarif(filePath) {
+              const out = { total:0, critical:0, high:0, medium:0, low:0, table:'' };
+              try {
+                if (!fs.existsSync(filePath)) {
+                  out.table = '> SARIF file not found — check Actions artifacts.';
+                  return out;
+                }
+                const sarif = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                for (const run of (sarif.runs || [])) {
+                  const rulesArray = run.tool?.driver?.rules || [];
+                  const findings   = [];
+                  for (const result of (run.results || [])) {
+                    out.total++;
+                    const sev      = getSeverity(result, rulesArray);
+                    const rule     = rulesArray[result.ruleIndex ?? 0] || {};
+                    const loc      = result.locations?.[0]?.physicalLocation;
+                    const file     = loc?.artifactLocation?.uri || 'unknown';
+                    const line     = loc?.region?.startLine || '-';
+                    const desc     = result.message?.text || rule.shortDescription?.text || '';
+                    const short    = desc.length > 90 ? desc.substring(0, 90) + '...' : desc;
+                    const ruleName = rule.name || rule.shortDescription?.text || result.ruleId || 'unknown';
+                    const shortRule= ruleName.length > 30 ? ruleName.substring(0, 30) + '...' : ruleName;
+                    if (sev === 'CRITICAL') out.critical++;
+                    else if (sev === 'HIGH') out.high++;
+                    else if (sev === 'MEDIUM') out.medium++;
+                    else out.low++;
+                    findings.push({ sev, shortRule, file, line, short });
+                  }
+                  findings.sort((a, b) => sevOrder(a.sev) - sevOrder(b.sev));
+                  if (findings.length > 0) {
+                    const shown    = findings.slice(0, 15);
+                    const overflow = findings.length > 15
+                      ? `\n> Showing first 15 of **${findings.length}** findings.`
+                      : '';
+                    out.table = '\n| Severity | Rule | File | Line | Description |\n|----------|------|------|------|-------------|\n'
+                      + shown.map(f => `| ${sevIcon(f.sev)} | ${f.shortRule} | \`${f.file}\` | ${f.line} | ${f.short} |`).join('\n')
+                      + overflow;
+                  }
+                }
+              } catch(err) {
+                out.table = `> Could not parse SARIF: ${err.message}`;
+              }
+              return out;
+            }
 
-            ${overall
-              ? '> ✅ All scans passed. No issues found.'
-              : '> ❌ Issues found. Check **Security tab** → Code scanning alerts and inline PR annotations for details.'}
+            // ── Parse all 4 SARIF files ────────────────────────
+            const parsed = {};
+            for (const [key, meta] of Object.entries(results_meta)) {
+              parsed[key] = parseSarif(meta.file);
+            }
 
-            [View in Orca portal](https://app.us.orcasecurity.io) | [Security tab findings](/${{ github.repository }}/security/code-scanning)`;
+            const totalAll = Object.values(parsed).reduce((s, p) => s + p.total, 0);
 
-            // Delete previous bot comment if exists (keeps PR clean)
+            // ── Build status table ─────────────────────────────
+            const icon   = m => m.pass ? '✅' : '❌';
+            const status = m => m.pass ? 'Pass' : `Fail (exit: ${m.exit})`;
+            const counts = p => `🔴${p.critical} 🟠${p.high} 🟡${p.medium} 🔵${p.low}`;
+
+            let statusTable = `| Scan | Status | Findings | Breakdown |\n|------|--------|----------|-----------|\n`;
+            for (const [key, meta] of Object.entries(results_meta)) {
+              const p = parsed[key];
+              statusTable += `| ${meta.label} | ${icon(meta)} ${status(meta)} | ${p.total} | ${counts(p)} |\n`;
+            }
+
+            // ── Build findings sections ────────────────────────
+            let findingsSections = '';
+            for (const [key, meta] of Object.entries(results_meta)) {
+              const p = parsed[key];
+              if (p.total > 0) {
+                findingsSections += `\n<details>\n<summary><b>${meta.label}</b> — ${p.total} findings (🔴${p.critical} 🟠${p.high} 🟡${p.medium} 🔵${p.low})</summary>\n\n${p.table}\n\n</details>\n`;
+              }
+            }
+
+            // ── Assemble full comment ──────────────────────────
+            const body = `## 🔐 Orca Security Scan Results\n\n${statusTable}\n**Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`\n**Commit:** \`${{ github.sha }}\`\n**Total findings:** ${totalAll}\n\n### 📋 Findings by scan\n${findingsSections || '> ✅ All scans passed. No issues found.'}\n\n${overall ? '' : '> ❌ Fix the issues above and push again to re-trigger all scans.'}\n\n[View in Orca portal](https://app.us.orcasecurity.io)`;
+
+            // ── Delete old bot comment ─────────────────────────
             const comments = await github.rest.issues.listComments({
               issue_number: context.issue.number,
               owner: context.repo.owner,
-              repo: context.repo.repo
+              repo:  context.repo.repo
             });
             for (const c of comments.data) {
               if (c.user.type === 'Bot' && c.body.includes('Orca Security Scan Results')) {
                 await github.rest.issues.deleteComment({
                   owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  repo:  context.repo.repo,
                   comment_id: c.id
                 });
               }
             }
 
-            // Post fresh comment
+            // ── Post fresh comment ─────────────────────────────
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
+              repo:  context.repo.repo,
+              body:  body
             });
 
-      # ── Gate: fail pipeline if findings and FAIL_ON_FINDINGS=true
-      - name: Fail if issues found
+      - name: Fail if any scan found issues
         if: steps.evaluate.outputs.overall_pass == 'false' && env.FAIL_ON_FINDINGS == 'true'
         run: |
-          echo "❌ One or more Orca scans found issues."
-          echo "   SAST    exit: ${{ needs.sast-scan.outputs.exit_code }}"
-          echo "   IaC     exit: ${{ needs.iac-scan.outputs.exit_code }}"
-          echo "   SCA     exit: ${{ needs.sca-scan.outputs.exit_code }}"
-          echo "   Secrets exit: ${{ needs.secrets-scan.outputs.exit_code }}"
-          echo ""
-          echo "Check Security tab or PR annotations for details."
+          echo "One or more Orca scans found issues."
+          echo "  SAST    exit: ${{ needs.sast-scan.outputs.exit_code }}"
+          echo "  IaC     exit: ${{ needs.iac-scan.outputs.exit_code }}"
+          echo "  SCA     exit: ${{ needs.sca-scan.outputs.exit_code }}"
+          echo "  Secrets exit: ${{ needs.secrets-scan.outputs.exit_code }}"
           exit 1
