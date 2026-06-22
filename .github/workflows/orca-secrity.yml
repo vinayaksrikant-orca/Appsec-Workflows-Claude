@@ -32,7 +32,7 @@ permissions:
   pull-requests: write
 
 env:
-  PROJECT_KEY: your-project-key
+  PROJECT_KEY: testing-project-vinayak
   FAIL_ON_FINDINGS: ${{ github.event.inputs.fail_on_findings || 'true' }}
 
 jobs:
