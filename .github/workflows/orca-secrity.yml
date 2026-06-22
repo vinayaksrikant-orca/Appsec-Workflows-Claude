@@ -143,12 +143,21 @@ jobs:
         if: always()
         run: |
           echo "=== SARIF file contents ==="
-          cat results/sast.sarif 2>/dev/null \
-            | python3 -c "
+          if [ ! -f results/sast.sarif ]; then
+            echo "No SARIF file found"
+            exit 0
+          fi
+
+          # Write Python script to a temp file — avoids YAML quoting issues
+          cat > /tmp/parse_sarif.py << 'PYEOF'
 import json, sys
-data = json.load(sys.stdin)
+
+with open('results/sast.sarif') as f:
+    data = json.load(f)
+
 runs = data.get('runs', [])
 print(f'Total runs: {len(runs)}')
+
 for i, run in enumerate(runs):
     results = run.get('results', [])
     rules   = run.get('tool', {}).get('driver', {}).get('rules', [])
@@ -163,7 +172,9 @@ for i, run in enumerate(runs):
     if rules:
         print('--- First rule (full) ---')
         print(json.dumps(rules[0], indent=2))
-" 2>/dev/null || echo "Could not parse SARIF"
+PYEOF
+
+          python3 /tmp/parse_sarif.py 2>/dev/null || echo "Could not parse SARIF"
 
       - name: Post PR comment with inline findings
         if: github.event_name == 'pull_request'
