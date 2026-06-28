@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       exit_code: ${{ steps.scan.outputs.exit_code }}
+      sarif_exists: ${{ steps.check_sarif.outputs.sarif_exists }}
     steps:
 
       - name: Checkout Repository
@@ -50,6 +51,42 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ── Pre-flight: verify secrets and environment ──────────
+      - name: Pre-flight checks
+        run: |
+          echo "=== Environment check ==="
+          echo "PROJECT_KEY    : ${{ env.PROJECT_KEY }}"
+          echo "Runner OS      : ${{ runner.os }}"
+          echo "GitHub event   : ${{ github.event_name }}"
+          echo "Branch         : ${{ github.head_ref || github.ref_name }}"
+          echo ""
+          echo "=== API token check ==="
+          if [ -z "${{ secrets.ORCA_SECURITY_API_TOKEN }}" ]; then
+            echo "❌ ORCA_SECURITY_API_TOKEN is EMPTY or NOT SET"
+            echo "   → Go to: Repo → Settings → Secrets → Actions"
+            echo "   → Add secret named: ORCA_SECURITY_API_TOKEN"
+            exit 1
+          else
+            TOKEN_LEN=$(echo -n "${{ secrets.ORCA_SECURITY_API_TOKEN }}" | wc -c)
+            echo "✅ ORCA_SECURITY_API_TOKEN is set (length: $TOKEN_LEN chars)"
+          fi
+          echo ""
+          echo "=== Project key check ==="
+          if [ "${{ env.PROJECT_KEY }}" == "your-project-key" ] || [ -z "${{ env.PROJECT_KEY }}" ]; then
+            echo "❌ PROJECT_KEY is still placeholder or empty"
+            exit 1
+          else
+            echo "✅ PROJECT_KEY: ${{ env.PROJECT_KEY }}"
+          fi
+          echo ""
+          echo "=== Workspace files ==="
+          ls -la
+          echo ""
+          echo "=== results/ directory pre-scan ==="
+          mkdir -p results
+          ls -la results/
+
+      # ── Run the scan ────────────────────────────────────────
       - name: Run Orca SAST Scan
         id: scan
         continue-on-error: true
@@ -62,29 +99,86 @@ jobs:
           output: "results/"
           show_annotations: true
 
-      - name: Debug list results
+      # ── Post-scan diagnostics ───────────────────────────────
+      - name: Post-scan diagnostics
         if: always()
-        run: ls -la results/ || echo "results/ directory is empty or missing"
+        run: |
+          echo "=== Scan exit code ==="
+          echo "steps.scan.outputs.exit_code : ${{ steps.scan.outputs.exit_code }}"
+          echo "steps.scan.outcome           : ${{ steps.scan.outcome }}"
+          echo ""
+          echo "=== results/ directory after scan ==="
+          ls -la results/ 2>/dev/null || echo "❌ results/ directory missing entirely"
+          echo ""
+          echo "=== All files in workspace ==="
+          find . -name "*.sarif" 2>/dev/null | head -20
+          find . -name "*.json"  -path "*/results/*" 2>/dev/null | head -10
+          find . -name "*.log"   2>/dev/null | head -10
+          echo ""
+          echo "=== Any Orca output files ==="
+          find . -name "orca*" 2>/dev/null | head -20
+          echo ""
+          echo "=== Environment variables from scan action ==="
+          env | grep -i orca || echo "No ORCA env vars found"
 
+      # ── Check if SARIF was produced ─────────────────────────
+      - name: Check SARIF exists
+        id: check_sarif
+        if: always()
+        run: |
+          if [ -f "results/sast.sarif" ]; then
+            SIZE=$(wc -c < results/sast.sarif)
+            echo "✅ results/sast.sarif exists (size: $SIZE bytes)"
+            echo "sarif_exists=true" >> $GITHUB_OUTPUT
+
+            echo ""
+            echo "=== SARIF file preview (first 50 lines) ==="
+            head -50 results/sast.sarif
+
+          else
+            echo "❌ results/sast.sarif does NOT exist"
+            echo "sarif_exists=false" >> $GITHUB_OUTPUT
+
+            echo ""
+            echo "=== Checking for alternative SARIF filenames ==="
+            find results/ -name "*.sarif" 2>/dev/null || echo "No .sarif files found in results/"
+            find . -name "*.sarif" 2>/dev/null || echo "No .sarif files anywhere in workspace"
+
+            echo ""
+            echo "=== Possible causes ==="
+            echo "1. ORCA_SECURITY_API_TOKEN is invalid or expired"
+            echo "2. PROJECT_KEY does not exist in Orca portal"
+            echo "3. Network connectivity issue to packages.orcasecurity.io"
+            echo "4. Orca action crashed before writing output"
+          fi
+
+      # ── Debug SARIF severity fields ─────────────────────────
       - name: Debug show SARIF severity fields
         if: always()
         run: |
           if [ ! -f results/sast.sarif ]; then
-            echo "No SARIF file found — skipping debug"
+            echo "No SARIF file found — skipping"
           else
             echo "aW1wb3J0IGpzb24Kd2l0aCBvcGVuKCJyZXN1bHRzL3Nhc3Quc2FyaWYiKSBhcyBmOgogICAgZGF0YSA9IGpzb24ubG9hZChmKQpydW5zID0gZGF0YS5nZXQoInJ1bnMiLCBbXSkKcHJpbnQoZiJUb3RhbCBydW5zOiB7bGVuKHJ1bnMpfSIpCmZvciBpLCBydW4gaW4gZW51bWVyYXRlKHJ1bnMpOgogICAgcmVzdWx0cyA9IHJ1bi5nZXQoInJlc3VsdHMiLCBbXSkKICAgIHJ1bGVzID0gcnVuLmdldCgidG9vbCIsIHt9KS5nZXQoImRyaXZlciIsIHt9KS5nZXQoInJ1bGVzIiwgW10pCiAgICBwcmludChmIlJ1biB7aX06IHtsZW4ocmVzdWx0cyl9IHJlc3VsdHMsIHtsZW4ocnVsZXMpfSBydWxlcyIpCiAgICBpZiByZXN1bHRzOgogICAgICAgIHByaW50KCItLS0gRmlyc3QgcmVzdWx0IC0tLSIpCiAgICAgICAgcHJpbnQoanNvbi5kdW1wcyhyZXN1bHRzWzBdLCBpbmRlbnQ9MikpCiAgICBpZiBydWxlczoKICAgICAgICBwcmludCgiLS0tIEZpcnN0IHJ1bGUgLS0tIikKICAgICAgICBwcmludChqc29uLmR1bXBzKHJ1bGVzWzBdLCBpbmRlbnQ9MikpCg==" | base64 -d | python3 2>/dev/null || echo "Could not parse SARIF"
           fi
 
+      # ── Upload SARIF only if it exists ──────────────────────
       - name: Upload SAST SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: always() && steps.check_sarif.outputs.sarif_exists == 'true'
         with:
           sarif_file: results/sast.sarif
           category: orca-sast
 
+      - name: Skip SARIF upload — file not found
+        if: always() && steps.check_sarif.outputs.sarif_exists != 'true'
+        run: |
+          echo "⚠️ Skipping SARIF upload — results/sast.sarif was not produced"
+          echo "Check the Post-scan diagnostics step above for the root cause"
+
       - name: Upload SAST artifact
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.check_sarif.outputs.sarif_exists == 'true'
         with:
           name: orca-sast-results
           path: results/sast.sarif
@@ -94,9 +188,18 @@ jobs:
         if: always()
         run: |
           EXIT="${{ steps.scan.outputs.exit_code }}"
-          if [ "$EXIT" == "0" ]; then STATUS="✅ No issues found"; else STATUS="❌ Issues found (exit code: $EXIT)"; fi
+          SARIF="${{ steps.check_sarif.outputs.sarif_exists }}"
+          if [ "$SARIF" != "true" ]; then
+            STATUS="⚠️ Scan did not produce output — check Pre-flight and Post-scan steps"
+          elif [ "$EXIT" == "0" ]; then
+            STATUS="✅ No issues found"
+          else
+            STATUS="❌ Issues found (exit code: $EXIT)"
+          fi
           echo "### SAST Scan" >> $GITHUB_STEP_SUMMARY
           echo "**Status:** $STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "**SARIF produced:** $SARIF" >> $GITHUB_STEP_SUMMARY
+          echo "**Exit code:** $EXIT" >> $GITHUB_STEP_SUMMARY
           echo "**Branch:** ${{ github.head_ref || github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
 
@@ -111,16 +214,27 @@ jobs:
         id: evaluate
         run: |
           EXIT="${{ needs.sast-scan.outputs.exit_code }}"
-          echo "SAST exit code: $EXIT"
-          if [ "$EXIT" == "0" ]; then
+          SARIF="${{ needs.sast-scan.outputs.sarif_exists }}"
+          echo "SAST exit code  : $EXIT"
+          echo "SARIF produced  : $SARIF"
+
+          # Only pass if scan ran AND exit code is 0
+          if [ "$SARIF" == "true" ] && [ "$EXIT" == "0" ]; then
             echo "sast_pass=true" >> $GITHUB_OUTPUT
           else
             echo "sast_pass=false" >> $GITHUB_OUTPUT
           fi
 
+          # Flag if scan didn't produce output at all
+          if [ "$SARIF" != "true" ]; then
+            echo "scan_failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "scan_failed=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Download SAST artifact
         uses: actions/download-artifact@v4
-        if: always()
+        if: needs.sast-scan.outputs.sarif_exists == 'true'
         with:
           name: orca-sast-results
           path: results/
@@ -135,6 +249,7 @@ jobs:
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Scan | SAST (source code) |" >> $GITHUB_STEP_SUMMARY
           echo "| Exit code | ${{ needs.sast-scan.outputs.exit_code }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SARIF produced | ${{ needs.sast-scan.outputs.sarif_exists }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.head_ref || github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
 
@@ -144,33 +259,53 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const exit_code = '${{ needs.sast-scan.outputs.exit_code }}';
-            const pass = ${{ steps.evaluate.outputs.sast_pass }};
+            const exit_code   = '${{ needs.sast-scan.outputs.exit_code }}';
+            const pass        = ${{ steps.evaluate.outputs.sast_pass }};
+            const scan_failed = ${{ steps.evaluate.outputs.scan_failed }};
 
-            // KEY FIX: Orca SAST SARIF uses ruleIndex (not ruleId) to look up rules
-            // AND uses numeric CVSS score in security-severity (not HIGH/MEDIUM strings)
+            // ── If scan didn't produce output — post diagnostic comment ──
+            if (scan_failed) {
+              const body = `## 🔐 Orca SAST Scan Result\n\n⚠️ **Scan did not produce output.** The Orca scanner failed before writing results.\n\n**Common causes:**\n- \`ORCA_SECURITY_API_TOKEN\` secret is missing, expired, or invalid\n- \`PROJECT_KEY\` (\`${{ env.PROJECT_KEY }}\`) does not exist in the Orca portal\n- Network connectivity issue from the runner to Orca's servers\n\n**To fix:**\n1. Go to: [Repo → Settings → Secrets → Actions](/${{ github.repository }}/settings/secrets/actions)\n2. Verify \`ORCA_SECURITY_API_TOKEN\` is set and not expired\n3. Check the **Pre-flight checks** step in the Actions log for details\n\n**Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`\n**Commit:** \`${{ github.sha }}\``;
+
+              const comments = await github.rest.issues.listComments({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              for (const c of comments.data) {
+                if (c.user.type === 'Bot' && c.body.includes('Orca SAST Scan Result')) {
+                  await github.rest.issues.deleteComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: c.id
+                  });
+                }
+              }
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+              return;
+            }
+
+            // ── Normal flow — parse SARIF and post findings ──────────────
             function getSeverity(result, rulesArray) {
-              // Use ruleIndex to find the rule — ruleId does NOT match rule.id in Orca SARIF
-              const idx      = result.ruleIndex ?? 0;
-              const rule     = rulesArray[idx] || {};
-              const rProps   = rule.properties || {};
-
-              // Priority 1: CVSS numeric score → map to severity label
-              const score = parseFloat(rProps['security-severity'] || '0');
+              const idx    = result.ruleIndex ?? 0;
+              const rule   = rulesArray[idx] || {};
+              const rProps = rule.properties || {};
+              const score  = parseFloat(rProps['security-severity'] || '0');
               if (score >= 9.0) return 'CRITICAL';
               if (score >= 7.0) return 'HIGH';
               if (score >= 4.0) return 'MEDIUM';
               if (score >  0.0) return 'LOW';
-
-              // Priority 2: defaultConfiguration.level fallback
               const level = rule.defaultConfiguration?.level || result.level || '';
               if (level === 'error')   return 'HIGH';
               if (level === 'warning') return 'MEDIUM';
               if (level === 'note')    return 'LOW';
-
               return 'MEDIUM';
             }
-
             function sevIcon(s) {
               return {CRITICAL:'🔴 Critical',HIGH:'🟠 High',MEDIUM:'🟡 Medium',LOW:'🔵 Low'}[s] || '⚪ Unknown';
             }
@@ -186,7 +321,6 @@ jobs:
               if (fs.existsSync('results/sast.sarif')) {
                 const sarif = JSON.parse(fs.readFileSync('results/sast.sarif', 'utf8'));
                 for (const run of (sarif.runs || [])) {
-                  // Use array — ruleIndex is the lookup key not ruleId
                   const rulesArray = run.tool?.driver?.rules || [];
                   const findings = [];
                   for (const result of (run.results || [])) {
@@ -225,7 +359,7 @@ jobs:
             const icon   = pass ? '✅' : '❌';
             const status = pass ? 'Pass' : `Fail (exit code: ${exit_code})`;
             const counts = `🔴 ${critical} Critical   🟠 ${high} High   🟡 ${medium} Medium   🔵 ${low} Low`;
-            const body = `## 🔐 Orca SAST Scan Result\n\n| Scan type | Status | Total findings |\n|-----------|--------|----------------|\n| SAST (source code) | ${icon} ${status} | ${totalFindings} |\n\n**Branch:** \`${{ github.head_ref }}\` to \`${{ github.base_ref }}\`\n**Commit:** \`${{ github.sha }}\`\n\n**Severity breakdown:** ${counts}\n\n### Findings\n${totalFindings > 0 ? findingsTable : '> ✅ No issues found.'}\n\n${pass ? '' : '> ❌ Fix the issues above and push again to re-trigger the scan.'}\n\n[View in Orca portal](https://app.us.orcasecurity.io)`;
+            const body = `## 🔐 Orca SAST Scan Result\n\n| Scan type | Status | Total findings |\n|-----------|--------|----------------|\n| SAST (source code) | ${icon} ${status} | ${totalFindings} |\n\n**Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`\n**Commit:** \`${{ github.sha }}\`\n\n**Severity breakdown:** ${counts}\n\n### Findings\n${totalFindings > 0 ? findingsTable : '> ✅ No issues found.'}\n\n${pass ? '' : '> ❌ Fix the issues above and push again to re-trigger the scan.'}\n\n[View in Orca portal](https://app.us.orcasecurity.io)`;
 
             const comments = await github.rest.issues.listComments({
               issue_number: context.issue.number,
@@ -251,5 +385,7 @@ jobs:
       - name: Fail if SAST found issues
         if: steps.evaluate.outputs.sast_pass == 'false' && env.FAIL_ON_FINDINGS == 'true'
         run: |
-          echo "SAST scan found issues. Exit code: ${{ needs.sast-scan.outputs.exit_code }}"
+          echo "SAST scan found issues or scan failed to produce output."
+          echo "Exit code   : ${{ needs.sast-scan.outputs.exit_code }}"
+          echo "SARIF exists: ${{ needs.sast-scan.outputs.sarif_exists }}"
           exit 1
